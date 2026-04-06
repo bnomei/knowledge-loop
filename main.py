@@ -48,13 +48,22 @@ class LoopConfig:
     max_population: int = 50
     top_context: int = 8
     questions_per_iteration: int = 3
+    explore_questions_per_iteration: int = 1
     lineage_context_artifacts: int = 20
     reference_context_limit: int = 200
+    registry_context_limit: int = 50
+    context_leader_slots: int = 3
+    context_underused_slots: int = 2
+    context_frame_breaker_slots: int = 1
+    registry_anchor_slots: int = 16
+    registry_recent_slots: int = 12
+    registry_underused_slots: int = 12
     question_embed_similarity: float = 0.90
     claim_embed_similarity: float = 0.92
     question_lexical_prefilter: float = 0.45
     claim_lexical_prefilter: float = 0.45
     artifact_dedup_reject_threshold: float = 0.85
+    novelty_bonus_weight: float = 0.12
     registry_match_threshold: float = 0.72
     registry_meaning_conflict_threshold: float = 0.45
     registry_name_weight: float = 0.6
@@ -133,6 +142,8 @@ class StrictModel(BaseModel):
 StructuredSchema = TypeVar("StructuredSchema", bound=StrictModel)
 EvidenceType = Literal["conjecture", "mechanism", "synthesis", "mixed", "evidence-backed"]
 EvidenceStrength = Literal["unknown", "low", "mixed", "moderate", "high"]
+QuestionKind = Literal["gap", "refinement", "challenge", "contradiction", "generalization"]
+QuestionMode = Literal["exploit", "explore"]
 
 
 # -------------------------
@@ -162,7 +173,8 @@ class Claim(StrictModel):
 class Question(StrictModel):
     id: str = Field(default_factory=new_id)
     text: str
-    kind: Literal["gap", "refinement", "challenge", "contradiction", "generalization"]
+    kind: QuestionKind
+    mode: QuestionMode = "exploit"
 
 
 class TopicSeed(StrictModel):
@@ -196,6 +208,7 @@ class Artifact(StrictModel):
     score2: float = 0.0
     adversarial: float = 0.0
     dedup: float = 0.0
+    novelty: float = 0.0
     reuse: int = 0
     fate: float = 0.0
 
@@ -212,7 +225,13 @@ class State(StrictModel):
 # -------------------------
 
 class QBatch(StrictModel):
-    questions: List[Question]
+    questions: List["PlannedQuestion"]
+
+
+class PlannedQuestion(StrictModel):
+    text: str
+    kind: QuestionKind
+    mode: QuestionMode
 
 
 class Draft(StrictModel):
@@ -245,6 +264,7 @@ class DraftEvaluation:
     score2: float
     adversarial: float
     dedup: float
+    novelty: float
     reuse: int
 
     @property
@@ -254,6 +274,7 @@ class DraftEvaluation:
             self.score2,
             self.adversarial,
             self.dedup,
+            self.novelty,
             self.reuse,
         )
 
@@ -399,6 +420,217 @@ def top_artifacts(state: State, n: int = TOP_CONTEXT) -> List[Artifact]:
     return sorted(state.artifacts, key=lambda a: a.fate, reverse=True)[:n]
 
 
+def stable_iteration_rank(namespace: str, state: State, value: str) -> str:
+    """Deterministic pseudo-random ordering keyed to the current iteration."""
+    return fingerprint(f"{namespace}:{state.iteration}:{value}")
+
+
+def take_unique_artifacts(
+    selected: List[tuple[Artifact, str]],
+    selected_ids: set[str],
+    candidates: List[Artifact],
+    count: int,
+    role: str,
+) -> None:
+    """Append up to count unseen artifacts tagged with the given context role."""
+    if count <= 0:
+        return
+
+    taken = 0
+    for artifact in candidates:
+        if artifact.id in selected_ids:
+            continue
+        selected.append((artifact, role))
+        selected_ids.add(artifact.id)
+        taken += 1
+        if taken >= count:
+            return
+
+
+def select_context_artifacts(
+    state: State,
+    n: int = TOP_CONTEXT,
+) -> List[tuple[Artifact, str]]:
+    """Mix leaders, underused branches, frame-breakers, and sampled survivors."""
+    if n <= 0 or not state.artifacts:
+        return []
+
+    selected: List[tuple[Artifact, str]] = []
+    selected_ids: set[str] = set()
+    artifacts = list(state.artifacts)
+
+    leaders = sorted(artifacts, key=lambda artifact: (artifact.fate, artifact.reuse), reverse=True)
+    take_unique_artifacts(
+        selected,
+        selected_ids,
+        leaders,
+        min(CONFIG.context_leader_slots, n),
+        "leader",
+    )
+
+    remaining_slots = max(n - len(selected), 0)
+    if remaining_slots:
+        underused = sorted(
+            artifacts,
+            key=lambda artifact: (
+                artifact.reuse,
+                len(artifact.parents) + len(artifact.references),
+                -artifact.fate,
+                artifact.created_at,
+            ),
+        )
+        take_unique_artifacts(
+            selected,
+            selected_ids,
+            underused,
+            min(CONFIG.context_underused_slots, remaining_slots),
+            "underused",
+        )
+
+    remaining_slots = max(n - len(selected), 0)
+    if remaining_slots:
+        frame_breakers = [
+            artifact
+            for artifact in artifacts
+            if artifact.question.kind in {"challenge", "contradiction", "generalization"}
+        ]
+        frame_breakers = sorted(
+            frame_breakers,
+            key=lambda artifact: stable_iteration_rank("frame-breaker", state, artifact.id),
+        )
+        take_unique_artifacts(
+            selected,
+            selected_ids,
+            frame_breakers,
+            min(CONFIG.context_frame_breaker_slots, remaining_slots),
+            "frame_breaker",
+        )
+
+    remaining_slots = max(n - len(selected), 0)
+    if remaining_slots:
+        sampled = sorted(
+            artifacts,
+            key=lambda artifact: stable_iteration_rank("artifact-sample", state, artifact.id),
+        )
+        take_unique_artifacts(selected, selected_ids, sampled, remaining_slots, "sampled")
+
+    return selected[:n]
+
+
+def definition_usage_counts(state: State) -> dict[str, int]:
+    """Count how often each registry definition is referenced by current artifacts."""
+    counts = {registry.id: 0 for registry in state.registry}
+    for artifact in state.artifacts:
+        for definition_id in artifact.referenced_definition_ids:
+            counts[definition_id] = counts.get(definition_id, 0) + 1
+    return counts
+
+
+def take_unique_registry_entries(
+    selected: List[tuple[RegistryDefinition, str, int]],
+    selected_ids: set[str],
+    candidates: List[RegistryDefinition],
+    count: int,
+    role: str,
+    usage_counts: dict[str, int],
+) -> None:
+    """Append up to count unseen registry entries tagged with their sampling role."""
+    if count <= 0:
+        return
+
+    taken = 0
+    for registry in candidates:
+        if registry.id in selected_ids:
+            continue
+        selected.append((registry, role, usage_counts.get(registry.id, 0)))
+        selected_ids.add(registry.id)
+        taken += 1
+        if taken >= count:
+            return
+
+
+def select_registry_entries(
+    state: State,
+    n: Optional[int] = None,
+) -> List[tuple[RegistryDefinition, str, int]]:
+    """Mix anchor, underused, recent, and sampled registry concepts."""
+    if not state.registry:
+        return []
+
+    limit = n or CONFIG.registry_context_limit
+    usage_counts = definition_usage_counts(state)
+    index_by_id = {registry.id: idx for idx, registry in enumerate(state.registry)}
+
+    selected: List[tuple[RegistryDefinition, str, int]] = []
+    selected_ids: set[str] = set()
+
+    anchors = sorted(
+        state.registry,
+        key=lambda registry: (
+            usage_counts.get(registry.id, 0),
+            registry.status == "active",
+            -index_by_id[registry.id],
+        ),
+        reverse=True,
+    )
+    take_unique_registry_entries(
+        selected,
+        selected_ids,
+        anchors,
+        min(CONFIG.registry_anchor_slots, limit),
+        "anchor",
+        usage_counts,
+    )
+
+    remaining_slots = max(limit - len(selected), 0)
+    if remaining_slots:
+        underused = sorted(
+            state.registry,
+            key=lambda registry: (
+                usage_counts.get(registry.id, 0),
+                -index_by_id[registry.id],
+                registry.status != "active",
+            ),
+        )
+        take_unique_registry_entries(
+            selected,
+            selected_ids,
+            underused,
+            min(CONFIG.registry_underused_slots, remaining_slots),
+            "underused",
+            usage_counts,
+        )
+
+    remaining_slots = max(limit - len(selected), 0)
+    if remaining_slots:
+        recent = list(reversed(state.registry))
+        take_unique_registry_entries(
+            selected,
+            selected_ids,
+            recent,
+            min(CONFIG.registry_recent_slots, remaining_slots),
+            "recent",
+            usage_counts,
+        )
+
+    remaining_slots = max(limit - len(selected), 0)
+    if remaining_slots:
+        sampled = sorted(
+            state.registry,
+            key=lambda registry: stable_iteration_rank("registry-sample", state, registry.id),
+        )
+        take_unique_registry_entries(
+            selected,
+            selected_ids,
+            sampled,
+            remaining_slots,
+            "sampled",
+            usage_counts,
+        )
+
+    return selected[:limit]
+
+
 def topic_seed_payload(seed: TopicSeed) -> dict[str, object]:
     """Trim the seed down to the fields that should steer question generation."""
     return {
@@ -429,11 +661,15 @@ Seed rules:
 
 def context_blob(state: State) -> str:
     """Compact summary of the strongest artifacts and the current registry."""
+    context_artifacts = select_context_artifacts(state)
+    registry_entries = select_registry_entries(state)
     payload = {
         "artifacts": [
             {
                 "id": a.id,
+                "context_role": role,
                 "question": a.question.text,
+                "question_mode": a.question.mode,
                 "answer": a.answer[:1500],
                 "claims": [c.text for c in a.claims[:5]],
                 "definitions": [d.name for d in a.definitions[:5]],
@@ -441,25 +677,42 @@ def context_blob(state: State) -> str:
                 "evidence_strength": a.evidence_strength,
                 "competing_hypothesis": a.competing_hypothesis[:240],
                 "main_failure_case": a.main_failure_case[:240],
+                "novelty": a.novelty,
                 "fate": a.fate,
                 "reuse": a.reuse,
             }
-            for a in top_artifacts(state)
+            for a, role in context_artifacts
         ],
         "registry": [
             {
                 "id": r.id,
+                "context_role": role,
                 "name": r.name,
                 "meaning": r.meaning[:300],
                 "aliases": r.aliases[:5],
                 "status": r.status,
+                "usage_count": usage_count,
             }
-            for r in state.registry[:50]
+            for r, role, usage_count in registry_entries
         ],
     }
     if state.seed is not None:
         payload["seed"] = topic_seed_payload(state.seed)
     return json.dumps(payload, ensure_ascii=False)
+
+
+def question_batch_plan() -> str:
+    """Describe the exploit/explore quota for each question batch."""
+    explore_count = min(CONFIG.explore_questions_per_iteration, QUESTION_BATCH_SIZE)
+    exploit_count = max(QUESTION_BATCH_SIZE - explore_count, 0)
+    return (
+        "Batch composition:\n"
+        f"- exactly {exploit_count} exploit questions: deepen, sharpen, or stress-test the strongest current lines of inquiry\n"
+        f"- exactly {explore_count} explore questions: challenge the dominant framing, import a neighboring lens, or test a neglected assumption\n"
+        "- explore questions should usually be contradiction, challenge, or generalization questions\n"
+        "- explore questions should not be mere parameter tweaks or renamings of the current dominant architecture\n"
+        "- use mode=exploit or mode=explore on each question\n"
+    )
 
 
 def build_question_prompt(state: State) -> str:
@@ -472,7 +725,11 @@ Rules:
 - avoid vague philosophy
 - prefer gaps, contradictions, refinements, challenges, or generalizations
 - questions should be answerable in plain language
-- reuse existing concepts where possible
+- reuse existing concepts when they genuinely clarify or connect lines of inquiry
+- prefer a new framing when it exposes a materially different mechanism, assumption, or failure mode
+- treat leader artifacts and anchor registry entries as the current dominant frame, not as ground truth
+
+{question_batch_plan()}
 
 {topic_seed_prompt(state)}
 
@@ -483,7 +740,10 @@ Context:
 
 def build_artifact_prompt(state: State, question: Question) -> str:
     """Build the structured drafting prompt from the reusable lineage surface."""
-    source_artifacts = top_artifacts(state, CONFIG.lineage_context_artifacts)
+    source_artifacts = [
+        artifact
+        for artifact, _ in select_context_artifacts(state, CONFIG.lineage_context_artifacts)
+    ]
     known_ids = [artifact.id for artifact in source_artifacts]
     known_claim_ids = [
         claim.id
@@ -549,9 +809,48 @@ Artifact:
 # Generation
 # -------------------------
 
+def normalize_question_modes(questions: List[Question]) -> List[Question]:
+    """Enforce the exploit/explore quota even when the model is sloppy about labels."""
+    if not questions:
+        return questions
+
+    explore_target = min(CONFIG.explore_questions_per_iteration, len(questions))
+    explore_indexes = [idx for idx, question in enumerate(questions) if question.mode == "explore"]
+
+    normalized = list(questions)
+    if len(explore_indexes) < explore_target:
+        preferred_indexes = [
+            idx
+            for idx, question in enumerate(normalized)
+            if question.kind in {"challenge", "contradiction", "generalization"}
+            and idx not in explore_indexes
+        ]
+        fallback_indexes = [
+            idx
+            for idx in range(len(normalized))
+            if idx not in explore_indexes and idx not in preferred_indexes
+        ]
+        promote_indexes = (preferred_indexes + fallback_indexes)[: explore_target - len(explore_indexes)]
+        for idx in promote_indexes:
+            normalized[idx] = normalized[idx].model_copy(update={"mode": "explore"})
+
+    elif len(explore_indexes) > explore_target:
+        for idx in explore_indexes[explore_target:]:
+            normalized[idx] = normalized[idx].model_copy(update={"mode": "exploit"})
+
+    return normalized
+
+
 def gen_questions(state: State) -> List[Question]:
     result = llm(build_question_prompt(state), QBatch, tokens=1000)
-    return result.questions
+    return normalize_question_modes([
+        Question(
+            text=planned.text,
+            kind=planned.kind,
+            mode=planned.mode,
+        )
+        for planned in result.questions
+    ])
 
 
 def gen_artifact(state: State, q: Question) -> Draft:
@@ -580,6 +879,23 @@ def judge2(d: Draft) -> float:
 
 def adversary(d: Draft) -> float:
     return llm(build_adversary_prompt(d), Adv, tokens=120).penalty
+
+
+def novelty_score(draft: Draft, state: State) -> float:
+    """Reward questions that move beyond the current dominant frame without going off-topic."""
+    dominant_questions = [
+        artifact.question.text
+        for artifact in top_artifacts(state, CONFIG.lineage_context_artifacts)
+    ]
+    if not dominant_questions:
+        return 0.5
+
+    dominant_similarity = max_embedding_similarity(
+        draft.question.text,
+        dominant_questions,
+        QUESTION_LEXICAL_PREFILTER,
+    )
+    return max(0.0, 1.0 - dominant_similarity)
 
 
 # -------------------------
@@ -736,12 +1052,20 @@ def apply_reuse_tracking(state: State, artifact: Artifact) -> None:
 # Fate
 # -------------------------
 
-def compute_fate(s1: float, s2: float, adv: float, dedup: float, reuse: int) -> float:
+def compute_fate(
+    s1: float,
+    s2: float,
+    adv: float,
+    dedup: float,
+    novelty: float,
+    reuse: int,
+) -> float:
     return max(
         ((s1 + s2) / 2.0)
         - abs(s1 - s2) * 0.4
         - adv * 0.7
         - dedup * 0.4
+        + novelty * CONFIG.novelty_bonus_weight
         + min(reuse * 0.05, 0.25),
         0.0,
     )
@@ -1001,6 +1325,7 @@ def evaluate_draft(draft: Draft, state: State, dedup: float) -> DraftEvaluation:
         score2=judge2(draft),
         adversarial=adversary(draft),
         dedup=dedup,
+        novelty=novelty_score(draft, state),
         reuse=compute_reuse(draft, state),
     )
 
@@ -1023,6 +1348,7 @@ def materialize_artifact(draft: Draft, evaluation: DraftEvaluation) -> Artifact:
         score2=evaluation.score2,
         adversarial=evaluation.adversarial,
         dedup=evaluation.dedup,
+        novelty=evaluation.novelty,
         reuse=evaluation.reuse,
     )
     artifact.fate = evaluation.fate
@@ -1048,7 +1374,7 @@ def format_artifact_progress(artifact: Artifact) -> str:
     """Stable progress line for per-question logging."""
     return (
         f"{artifact.question.text} -> "
-        f"fate={artifact.fate:.3f} dedup={artifact.dedup:.3f}"
+        f"fate={artifact.fate:.3f} dedup={artifact.dedup:.3f} novelty={artifact.novelty:.3f}"
     )
 
 
