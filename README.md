@@ -19,19 +19,23 @@ time. A single state file represents one exploration.
 This is a script-first local `uv` app, not a published PyPI package. Git tags
 mark source snapshots for the repository and tracked examples.
 
-## What The Script Does
+## How It Works
 
-Each iteration of [`main.py`](main.py):
-
-1. Loads a persisted state file, or creates a new empty one.
-2. Summarizes the strongest existing artifacts and registry concepts.
-3. Asks the model for a small batch of follow-up ideation questions, split
-   between `exploit` and `explore`.
-4. Drafts one structured answer per question.
-5. Scores the draft for usefulness and reuse, applies an adversarial penalty,
-   and deduplicates similar questions and claims.
-6. Persists the surviving artifacts back into the state file.
-7. Optionally renders a lineage graph as a PNG.
+```mermaid
+flowchart TD
+    start[Run main.py] --> load[Load or create state JSON]
+    load --> context[Summarize strongest artifacts and registry concepts]
+    context --> questions[Generate exploit and explore questions]
+    questions --> draft[Draft one structured artifact per question]
+    draft --> review[Score usefulness, reuse, grounding, overclaim, and dedup]
+    review --> keep{Artifact survives?}
+    keep --> update[Append artifact and update registry and reuse]
+    keep --> drop[Drop near-clone or weak draft]
+    update --> save[Write updated state JSON]
+    drop --> save
+    save --> graph[Optionally render lineage graph PNG]
+    graph --> next[Stop or run next iteration]
+```
 
 The loop is optimized for disciplined ideation, not truth-verification. It is
 best used to generate better frames, mechanisms, scenario ideas, and
@@ -44,6 +48,20 @@ By default:
 - state is written to `world_state.json`
 - the graph is written to `lineage_graph.png`
 
+## What A Run Produces
+
+The canonical output is the updated state JSON file. Stdout is only progress
+logging, and the graph PNG is only a visualization layer.
+
+After a normal run you get:
+
+- an updated state file with the latest `iteration`, `artifacts`, `registry`, and optional `seed`
+- optional graph output at `lineage_graph.png` or `path/to/state_lineage_graph.png`
+- console lines showing accepted or rejected artifacts for that run
+
+The runner does not emit a separate report object. If you want downstream
+automation or agent analysis, use the state JSON as the source of truth.
+
 ## What A "World State" Is
 
 A world state is the JSON file that stores one running exploration.
@@ -51,7 +69,7 @@ A world state is the JSON file that stores one running exploration.
 It contains:
 
 - `iteration`: the current iteration count
-- `artifacts`: the surviving question/answer records and their scores
+- `artifacts`: the surviving question and answer records plus their scores
 - `registry`: reusable definitions discovered during the run
 - optional `seed`: topic guidance for that exploration
 
@@ -66,7 +84,82 @@ Important behavior:
 - a world state is a working set, not a permanent archive of everything ever generated
 - the loop prunes artifacts over time, so low-value or displaced artifacts may disappear
 - if a state has a stored `seed`, future runs of that same state continue using it
-- the loop is ideation-first: `explore` questions open new frames, while `exploit` questions deepen or stress-test the strongest current line
+- `explore` questions open new frames, while `exploit` questions deepen or stress-test the strongest current line
+
+## Inspect Results With jq
+
+Because the output is structured JSON, `jq` is the ideal way to slice it for
+shell workflows and AI agents. Most agents should read a focused JSON view,
+not the entire state file.
+
+Basic run summary:
+
+```bash
+jq '{
+  iteration,
+  artifact_count: (.artifacts | length),
+  registry_count: (.registry | length),
+  seed_topic: (.seed.topic // null)
+}' world_state.json
+```
+
+Top artifacts by fate:
+
+```bash
+jq '[
+  .artifacts
+  | sort_by(.fate)
+  | reverse
+  | .[:5]
+  | .[]
+  | {
+      id,
+      mode: .question.mode,
+      question: .question.text,
+      fate,
+      novelty,
+      grounding_score,
+      overclaim_penalty
+    }
+]' world_state.json
+```
+
+Compact JSON slice for an AI agent:
+
+```bash
+jq -c '{
+  iteration,
+  seed,
+  top_artifacts: (
+    .artifacts
+    | sort_by(.fate)
+    | reverse
+    | .[:8]
+    | map({
+        id,
+        question: .question.text,
+        answer,
+        fate,
+        evidence_type,
+        evidence_strength,
+        claims: [.claims[].text],
+        open_questions
+      })
+  ),
+  registry: (
+    .registry
+    | map({
+        id,
+        name,
+        meaning,
+        status
+      })
+  )
+}' world_state.json
+```
+
+Use `jq -c` when you want one compact JSON object that an agent can consume
+directly without extra cleanup.
 
 ## Requirements
 
