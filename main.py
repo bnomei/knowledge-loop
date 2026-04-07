@@ -154,6 +154,24 @@ def configure_web_search(
     WEB_SEARCH_ALLOWED_DOMAINS = tuple(dict.fromkeys(allowed_domains or []))
 
 
+def validate_runtime_config(needs_api: bool) -> None:
+    """Fail fast on missing or empty runtime configuration."""
+    if not MODEL.strip():
+        raise ValueError("OPENAI_MODEL must not be empty.")
+    if not EMBED_MODEL.strip():
+        raise ValueError("OPENAI_EMBED_MODEL must not be empty.")
+    if not needs_api:
+        return
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError(
+            "OPENAI_API_KEY is required. "
+            "The script does not auto-load .env; use "
+            "'uv run --env-file .env ...' or export OPENAI_API_KEY."
+        )
+
+
 # -------------------------
 # Base model
 # -------------------------
@@ -1900,6 +1918,7 @@ def run(
     """Run several iterations of the ideation loop against the persisted state."""
     if iters < 0:
         raise ValueError("--iters must be zero or greater.")
+    validate_runtime_config(needs_api=iters > 0 or rejudge_existing)
 
     state, seed_changed = apply_seed(
         load_state(),

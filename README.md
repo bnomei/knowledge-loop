@@ -329,7 +329,9 @@ Runtime model configuration comes from environment variables:
   Optional. Defaults to `text-embedding-3-small`.
 
 The script does not load `.env` by itself. Use `uv run --env-file .env ...` if
-you want `.env` values injected into the process.
+you want `.env` values injected into the process. Startup now validates this
+configuration early and fails before the first model call if the required
+variables are missing or empty.
 
 ## Costs And Runtime Characteristics
 
