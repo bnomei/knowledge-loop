@@ -1,0 +1,12 @@
+.gitattributes export-ignore
+.env.example export-ignore
+.github export-ignore
+.github/** export-ignore
+.gitignore export-ignore
+LICENSE export-ignore
+README.md export-ignore
+pyproject.toml export-ignore
+seed.example.json export-ignore
+states export-ignore
+states/** export-ignore
+uv.lock export-ignore

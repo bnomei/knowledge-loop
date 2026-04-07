@@ -31,7 +31,24 @@ mark repository snapshots, not PyPI releases.
 
 Needs Python `3.9+`, `uv`, and an OpenAI API key.
 
-Run the default exploration:
+Fastest path:
+[download the current release zip](https://github.com/bnomei/ideation-loop/archive/refs/tags/v0.1.1.zip),
+which is exported as a one-file archive containing only `main.py`.
+
+```bash
+curl -L -o ideation-loop-v0.1.1.zip \
+  https://github.com/bnomei/ideation-loop/archive/refs/tags/v0.1.1.zip
+unzip -j ideation-loop-v0.1.1.zip
+export OPENAI_API_KEY="your_openai_api_key_here"
+uv run \
+  --with "openai>=2.30,<3" \
+  --with "pydantic>=2.12,<3" \
+  --with "matplotlib>=3.9,<4" \
+  --with "networkx>=3.2,<4" \
+  python -u main.py
+```
+
+Repo workflow:
 
 ```bash
 uv sync --frozen
@@ -417,4 +434,4 @@ Also note:
 - a seed is stored inside the selected state file, so you do not need to pass it again when continuing that exploration
 - the default behavior is intentionally conservative: an existing `world_state.json` is not reseeded unless you explicitly opt in with `--replace-seed`
 - treat `pyproject.toml` as the source of truth for the app version
-- treat Git tags such as `v0.1.0` as repository snapshots, not PyPI releases
+- treat Git tags such as `v0.1.1` as repository snapshots, not PyPI releases
