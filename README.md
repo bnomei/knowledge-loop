@@ -1,5 +1,12 @@
 # ideation-loop
 
+[![Git Tag](https://img.shields.io/github/v/tag/bnomei/ideation-loop?sort=semver)](https://github.com/bnomei/ideation-loop/tags)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/downloads/)
+[![uv](https://img.shields.io/badge/packaging-uv-2E3440?logo=uv)](https://docs.astral.sh/uv/)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
+[![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
+
 `ideation-loop` is a local ideation-first exploration loop runner built on
 the OpenAI API. It keeps a persistent "world state" in JSON, asks the model
 for follow-up questions, drafts structured answers, scores them for usefulness,
@@ -8,6 +15,9 @@ a lineage graph of the surviving artifacts.
 
 This repository is for running focused ideation and exploration loops over
 time. A single state file represents one exploration.
+
+This is a script-first local `uv` app, not a published PyPI package. Git tags
+mark source snapshots for the repository and tracked examples.
 
 ## What The Script Does
 
@@ -63,6 +73,12 @@ Important behavior:
 - `uv`
 - Python `3.9+`
 - an OpenAI API key
+
+## Release Model
+
+- use `uv sync --frozen` for reproducible local installs
+- treat `pyproject.toml` as the source of truth for the app version
+- treat Git tags such as `v0.1.0` as repository release snapshots, not PyPI releases
 
 If you do not already have `uv`:
 
