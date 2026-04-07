@@ -33,8 +33,8 @@ flowchart TD
     keep --> drop[Drop near-clone or weak draft]
     update --> save[Write updated state JSON]
     drop --> save
-    save --> graph[Optionally render lineage graph PNG]
-    graph --> next[Stop or run next iteration]
+    save --> render_graph[Optionally render lineage graph PNG]
+    render_graph --> next[Stop or run next iteration]
 ```
 
 The loop is optimized for disciplined ideation, not truth-verification. It is
