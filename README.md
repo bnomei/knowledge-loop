@@ -120,7 +120,7 @@ Use the same state file again.
 
 ```bash
 uv run --env-file .env python -u main.py \
-  --state-file states/cross-lingual-cot-trust.json \
+  --state-file runs/cross-lingual-cot-trust.json \
   --iters 3
 ```
 
@@ -138,7 +138,7 @@ developments:
 
 ```bash
 uv run --env-file .env python -u main.py \
-  --state-file states/current-topic.json \
+  --state-file runs/current-topic.json \
   --web-search \
   --iters 3
 ```
@@ -147,7 +147,7 @@ If you want to constrain search to specific sources:
 
 ```bash
 uv run --env-file .env python -u main.py \
-  --state-file states/current-topic.json \
+  --state-file runs/current-topic.json \
   --web-search \
   --web-search-domain www.anthropic.com \
   --web-search-domain openai.com \
@@ -163,7 +163,7 @@ Rescore only:
 
 ```bash
 uv run --env-file .env python -u main.py \
-  --state-file states/cross-lingual-cot-trust.json \
+  --state-file runs/cross-lingual-cot-trust.json \
   --rejudge-existing \
   --iters 0
 ```
@@ -172,7 +172,7 @@ Rescore first, then continue the loop:
 
 ```bash
 uv run --env-file .env python -u main.py \
-  --state-file states/cross-lingual-cot-trust.json \
+  --state-file runs/cross-lingual-cot-trust.json \
   --rejudge-existing \
   --iters 3
 ```
@@ -188,7 +188,7 @@ Use a separate state file so you do not disturb the default run.
 
 ```bash
 uv run --env-file .env python -u main.py \
-  --state-file states/medical-calibration.json \
+  --state-file runs/medical-calibration.json \
   --seed-topic "Trust calibration for medical advice without visible CoT" \
   --seed-goal "Prefer answer-level summaries and verification prompts over raw reasoning traces" \
   --seed-include "non-expert users" \
@@ -202,7 +202,7 @@ Use a richer seed file when you want more explicit guidance.
 
 ```bash
 uv run --env-file .env python -u main.py \
-  --state-file states/cross-lingual-cot-trust.json \
+  --state-file runs/cross-lingual-cot-trust.json \
   --seed-file seed.example.json
 ```
 
@@ -214,7 +214,7 @@ This is useful when you want to create the state first and run it later.
 
 ```bash
 uv run --env-file .env python -u main.py \
-  --state-file states/cross-lingual-cot-trust.json \
+  --state-file runs/cross-lingual-cot-trust.json \
   --seed-file seed.example.json \
   --iters 0
 ```
@@ -229,7 +229,7 @@ If you really want to reseed an existing populated state:
 
 ```bash
 uv run --env-file .env python -u main.py \
-  --state-file states/cross-lingual-cot-trust.json \
+  --state-file runs/cross-lingual-cot-trust.json \
   --seed-file seed.example.json \
   --replace-seed
 ```
@@ -245,6 +245,8 @@ For alternate state files:
 
 - `--state-file path/to/foo.json` writes state to `path/to/foo.json`
 - if `--graph-file` is omitted, the graph defaults to `path/to/foo_lineage_graph.png`
+- prefer `runs/*.json` for live local explorations; `runs/` is git-ignored
+- treat `states/*.json` as checked-in example snapshots, not your primary scratch area
 
 ## CLI Reference
 
