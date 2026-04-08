@@ -32,13 +32,13 @@ mark repository snapshots, not PyPI releases.
 Needs Python `3.9+`, `uv`, and an OpenAI API key.
 
 Fastest path:
-[download the current release zip](https://github.com/bnomei/ideation-loop/archive/refs/tags/v0.1.1.zip),
-which is exported as a one-file archive containing only `main.py`.
+[download the current `main` branch zip](https://github.com/bnomei/ideation-loop/archive/refs/heads/main.zip),
+then extract `main.py`.
 
 ```bash
-curl -L -o ideation-loop-v0.1.1.zip \
-  https://github.com/bnomei/ideation-loop/archive/refs/tags/v0.1.1.zip
-unzip -j ideation-loop-v0.1.1.zip
+curl -L -o ideation-loop-main.zip \
+  https://github.com/bnomei/ideation-loop/archive/refs/heads/main.zip
+unzip -j ideation-loop-main.zip '*/main.py'
 export OPENAI_API_KEY="your_openai_api_key_here"
 uv run \
   --with "openai>=2.30,<3" \
