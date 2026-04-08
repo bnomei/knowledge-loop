@@ -61,6 +61,14 @@ class LoopConfig:
     registry_anchor_slots: int = 16
     registry_recent_slots: int = 12
     registry_underused_slots: int = 12
+    seed_include_slots: int = 10
+    seed_avoid_slots: int = 10
+    seed_question_slots: int = 5
+    seed_definition_slots: int = 10
+    seed_include_core_slots: int = 4
+    seed_avoid_core_slots: int = 4
+    seed_question_core_slots: int = 2
+    seed_definition_core_slots: int = 4
     question_embed_similarity: float = 0.90
     claim_embed_similarity: float = 0.92
     question_lexical_prefilter: float = 0.45
@@ -191,6 +199,7 @@ class StrictModel(BaseModel):
 
 
 StructuredSchema = TypeVar("StructuredSchema", bound=StrictModel)
+SeedItem = TypeVar("SeedItem")
 EvidenceType = Literal[
     "conjecture", "mechanism", "synthesis", "mixed", "evidence-backed"
 ]
@@ -769,6 +778,69 @@ def take_unique_registry_entries(
             return
 
 
+def rotating_seed_window(
+    items: List[SeedItem],
+    total_slots: int,
+    core_slots: int,
+    iteration: int,
+) -> List[SeedItem]:
+    """Keep a stable core while rotating overflow items through the active slice."""
+    if total_slots <= 0 or not items:
+        return []
+    if len(items) <= total_slots:
+        return list(items)
+
+    core_count = min(core_slots, total_slots, len(items))
+    core = list(items[:core_count])
+    overflow = list(items[core_count:])
+    remaining_slots = total_slots - len(core)
+    if remaining_slots <= 0 or not overflow:
+        return core[:total_slots]
+
+    start = iteration % len(overflow)
+    rotated = overflow[start:] + overflow[:start]
+    return core + rotated[:remaining_slots]
+
+
+def active_seed_for_iteration(seed: TopicSeed, iteration: int) -> TopicSeed:
+    """Expose a bounded active slice of the full seed for the current iteration."""
+    return TopicSeed(
+        topic=seed.topic,
+        goal=seed.goal,
+        include=rotating_seed_window(
+            seed.include,
+            CONFIG.seed_include_slots,
+            CONFIG.seed_include_core_slots,
+            iteration,
+        ),
+        avoid=rotating_seed_window(
+            seed.avoid,
+            CONFIG.seed_avoid_slots,
+            CONFIG.seed_avoid_core_slots,
+            iteration,
+        ),
+        seed_questions=rotating_seed_window(
+            seed.seed_questions,
+            CONFIG.seed_question_slots,
+            CONFIG.seed_question_core_slots,
+            iteration,
+        ),
+        seed_definitions=rotating_seed_window(
+            seed.seed_definitions,
+            CONFIG.seed_definition_slots,
+            CONFIG.seed_definition_core_slots,
+            iteration,
+        ),
+    )
+
+
+def active_seed(state: State) -> Optional[TopicSeed]:
+    """Return the current iteration's active seed slice, if any."""
+    if state.seed is None:
+        return None
+    return active_seed_for_iteration(state.seed, state.iteration)
+
+
 def select_registry_entries(
     state: State,
     n: Optional[int] = None,
@@ -858,23 +930,24 @@ def topic_seed_payload(seed: TopicSeed) -> dict[str, object]:
     return {
         "topic": seed.topic,
         "goal": seed.goal,
-        "include": seed.include[:10],
-        "avoid": seed.avoid[:10],
-        "seed_questions": seed.seed_questions[:5],
+        "include": seed.include,
+        "avoid": seed.avoid,
+        "seed_questions": seed.seed_questions,
         "seed_definitions": [
-            definition.model_dump() for definition in seed.seed_definitions[:10]
+            definition.model_dump() for definition in seed.seed_definitions
         ],
     }
 
 
 def topic_seed_prompt(state: State) -> str:
     """Optional seed instructions that keep a new exploration on-topic."""
-    if state.seed is None:
+    current_seed = active_seed(state)
+    if current_seed is None:
         return ""
 
     return f"""
 Topic seed:
-{json.dumps(topic_seed_payload(state.seed), ensure_ascii=False)}
+{json.dumps(topic_seed_payload(current_seed), ensure_ascii=False)}
 
 Seed rules:
 - stay near the seeded topic unless a closely related contradiction, refinement, or generalization is clearly useful
@@ -924,8 +997,9 @@ def context_blob(state: State) -> str:
             for r, role, usage_count in registry_entries
         ],
     }
-    if state.seed is not None:
-        payload["seed"] = topic_seed_payload(state.seed)
+    current_seed = active_seed(state)
+    if current_seed is not None:
+        payload["seed"] = topic_seed_payload(current_seed)
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -1204,15 +1278,15 @@ def grounding_review(draft: Draft) -> GroundingReview:
 def novelty_anchor_texts(state: State) -> List[str]:
     """Seed and topic anchors that define the current exploration boundary."""
     anchors: List[str] = []
-
-    if state.seed is not None:
-        anchors.append(state.seed.topic)
-        if state.seed.goal:
-            anchors.append(state.seed.goal)
-        anchors.extend(state.seed.seed_questions[:5])
+    current_seed = active_seed(state)
+    if current_seed is not None:
+        anchors.append(current_seed.topic)
+        if current_seed.goal:
+            anchors.append(current_seed.goal)
+        anchors.extend(current_seed.seed_questions)
         anchors.extend(
             f"{definition.name}: {definition.meaning}"
-            for definition in state.seed.seed_definitions[:5]
+            for definition in current_seed.seed_definitions
         )
 
     return [anchor for anchor in anchors if anchor]
@@ -1281,34 +1355,62 @@ def find_registry_match(state: State, d: Definition) -> Optional[RegistryDefinit
     return best if best_score >= CONFIG.registry_match_threshold else None
 
 
+def attach_definition_to_registry(state: State, d: Definition) -> tuple[str, bool]:
+    """Reuse or create a registry entry for a definition and report if state changed."""
+    match = find_registry_match(state, d)
+    if match:
+        changed = False
+        if d.name != match.name and d.name not in match.aliases:
+            match.aliases.append(d.name)
+            changed = True
+
+        if (
+            lexical_similarity(d.meaning, match.meaning)
+            < CONFIG.registry_meaning_conflict_threshold
+            and match.status != "conflicted"
+        ):
+            match.status = "conflicted"
+            changed = True
+
+        return match.id, changed
+
+    reg = RegistryDefinition(
+        name=d.name,
+        meaning=d.meaning,
+        aliases=[],
+        fingerprint=fingerprint(d.name + "::" + d.meaning),
+    )
+    state.registry.append(reg)
+    return reg.id, True
+
+
 def register_defs(state: State, artifact: Artifact) -> None:
     """Attach draft definitions to the shared registry and record the ids used."""
     referenced_ids = []
 
     for d in artifact.definitions:
-        match = find_registry_match(state, d)
-        if match:
-            if d.name != match.name and d.name not in match.aliases:
-                match.aliases.append(d.name)
-
-            if (
-                lexical_similarity(d.meaning, match.meaning)
-                < CONFIG.registry_meaning_conflict_threshold
-            ):
-                match.status = "conflicted"
-
-            referenced_ids.append(match.id)
-        else:
-            reg = RegistryDefinition(
-                name=d.name,
-                meaning=d.meaning,
-                aliases=[],
-                fingerprint=fingerprint(d.name + "::" + d.meaning),
-            )
-            state.registry.append(reg)
-            referenced_ids.append(reg.id)
+        registry_id, _ = attach_definition_to_registry(state, d)
+        referenced_ids.append(registry_id)
 
     artifact.referenced_definition_ids = referenced_ids
+
+
+def preload_seed_definitions(state: State) -> bool:
+    """Materialize seed definitions into the registry so they can participate in context."""
+    if state.seed is None or not state.seed.seed_definitions:
+        return False
+
+    changed = False
+    for definition in state.seed.seed_definitions:
+        _, definition_changed = attach_definition_to_registry(state, definition)
+        changed = changed or definition_changed
+    return changed
+
+
+def migrate_state(state: State) -> tuple[State, bool]:
+    """Apply non-destructive state migrations when older files are loaded."""
+    changed = preload_seed_definitions(state)
+    return state, changed
 
 
 # -------------------------
@@ -1959,13 +2061,14 @@ def run(
         seed,
         replace_seed=replace_seed,
     )
+    state, migrated = migrate_state(state)
     persisted = False
 
     if rejudge_existing and rejudge_existing_artifacts(state):
         persist_iteration(state, git=git, render_graph=render_graph)
         persisted = True
 
-    if seed_changed and iters == 0 and not persisted:
+    if (seed_changed or migrated) and iters == 0 and not persisted:
         persist_iteration(state, git=git, render_graph=render_graph)
         persisted = True
 
